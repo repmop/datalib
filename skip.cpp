@@ -1,19 +1,21 @@
 /*
  * Implments a generic skip-list, with n sublists. Each sublist has a 
- * head, initialized on list creation. Each sublist shares the payloads of 
- * all of its nodes with that of the list below it. Each node in the list 
- * stores the number of nodes skipped by its link pointer (1 for the base list)
+ * head, initialized on list creation. Each sublist shares the payloads/hashes/sizes
+ * of its nodes with those of the list below it. 
  * See: https://en.wikipedia.org/wiki/Skip_list
  *
- * Interface notes: Relies on the definition of a comparison function, called
- * sl_compare().
+ * Interface notes: 
+ * -Relies on the (external) definition of a comparison, called
+ *   sl_compare().
+ * -Caller's responsibilty to seed the random.h state machine. Easily done
+ *   with a single srand(time(NULL)) call before first insert.
  */
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
-#define P .5f // Roll successively to see if node should be promoted [0,1)
+#define P 0.75f // Roll successively to see if node should be promoted [0,1)
 #define NUM_LISTS 4 // at least 1
 
 typedef struct ELE {
@@ -28,11 +30,6 @@ typedef struct ELE {
  */
 extern int sl_compare(void *h1, void *h2);
 extern list_ele_t *pack(void *val, size_t size, void *hash);
-
-
-
-
-
 
 class skip_list {
   public:
@@ -49,10 +46,17 @@ class skip_list {
     void sl_print(list_ele_t *start);
   private:
     bool sl_roll();
-    void ll_insert(list_ele_t *start, list_ele_t *node);
     void sl_promote(list_ele_t *node, list_ele_t **prev_pts, int list_num);
+    list_ele_t *ll_insert(list_ele_t *node, list_ele_t *start);
 };
 
+/*
+ * Insert immediately at head if list is empty or data will be the smallest
+ * node in the list. Else traverse from top left to bottom right, keeping
+ * track of the most recently visited node in each list to later do
+ * a constant time insert if list splice(s) need to be performed. Try and
+ * promote new node after insertion to speed up future accesses.
+ */
 bool skip_list::sl_insert(list_ele_t *data) {
   list_ele_t *node = (list_ele_t *) malloc(NUM_LISTS * sizeof(list_ele_t));
   if (!node) return false;
@@ -76,11 +80,16 @@ bool skip_list::sl_insert(list_ele_t *data) {
     for (int i = 0; i < NUM_LISTS; i++) {
       heads[i] = &pt[i];
       memcpy(&pt[i], node, sizeof(list_ele_t));
-      pt[i].next = NULL;
+      pt[i].next = old_head[i].next;
     }
     heads[0]->next = old_head;
     return true;  
   }
+  /*
+   * Do a traversal, if a node is found s.t. it compares to strictly less than
+   * node, insert node in the bottom list, then roll to potentially promote
+   * node into higher list(s).
+   */
   int i = NUM_LISTS - 1;
   list_ele_t *prev_pts[NUM_LISTS] = {NULL};
   list_ele_t *pt = heads[i];
@@ -88,16 +97,14 @@ bool skip_list::sl_insert(list_ele_t *data) {
   for (; i >= 0 ; i--) {
     prev_pts[i] = pt;
     while (pt->next != NULL) {
-      if (0 <= sl_compare(node->hash, pt->next->hash)) {
+      if (1 == sl_compare(node->hash, pt->next->hash)) {
         prev_pts[i] = pt;
         pt = pt->next;
       } 
-      // found insertion point for list 0
+      // found start point for linear search within list 0
       else { 
         prev_pts[0] = prev_pts[i] - i;
-        pt = prev_pts[0]->next;
-        node->next = pt;
-        prev_pts[0]->next = node;
+        prev_pts[0] = ll_insert(node, prev_pts[0]);
         sl_promote(node, prev_pts, i);
         return true;
       }
@@ -115,10 +122,43 @@ bool skip_list::sl_delete(list_ele_t *node) {
   return node==NULL;
 }
 
-list_ele_t *skip_list::sl_search(void *payload) {
-  return (list_ele_t *) payload;
+/*
+ * Traverse list from top left to bottom right, returning first node found
+ * this way on a hash match. Returns NULL if no node is found in this way.
+ */
+list_ele_t *skip_list::sl_search(void *hash) {
+  int i = NUM_LISTS - 1;
+  list_ele_t *pt = heads[i];
+  if (pt == NULL) {
+    return NULL;
+  }
+  for (; i >= 0 ; i--) {
+    int cmp;
+    if (0 == (cmp = sl_compare(hash, pt->hash))) {
+      return pt;
+    }
+    else if (0 > cmp) {
+      return NULL;
+    }
+    while (pt->next != NULL) {
+      if (1 == (cmp = sl_compare(hash, pt->next->hash))) {
+        pt = pt->next;
+      } 
+      else if (0 == cmp){ 
+        return pt->next;
+      }
+      else {
+        break;
+      }
+    }
+    pt -= 1;
+  }
+  return NULL;
 }
 
+/*
+ * Print out the skip list. If start is non-NULL, print that sublist first.
+ */
 void skip_list::sl_print(list_ele_t *start) {
   if (start != NULL) {
     while (start->next != NULL) {
@@ -142,34 +182,13 @@ void skip_list::sl_print(list_ele_t *start) {
     printf("|%ld|  --X\n", (long) pt->hash);
   }
 }
-
+/*
+ * Gives the output of a coin flip with probability 'P.'
+ */
 bool skip_list::sl_roll() {
   long r = random() % 1000;
-  bool out = ((float) r) > (P * (float) 1000);
+  bool out = ((float) r) < (P * (float) 1000);
   return out;
-}
-/*
- * Attempt to insert after start. If node preceedes start, change node's
- * next and rely on caller to handle actual insert
- */
-void skip_list::ll_insert(list_ele_t *start, list_ele_t *node) {
-  if (0 > sl_compare(node->hash, start->hash)) {
-    //node->next = start;
-    return;
-  }
-  list_ele_t *prev_pt = start;
-  list_ele_t *pt = prev_pt->next;
-  while (pt != NULL && 1 == sl_compare(node->hash, pt->hash)) {
-    if (pt->next == NULL) {
-      node->next = NULL;
-      pt->next = node;
-      return;
-    }
-    prev_pt = pt;
-    pt = pt->next;
-  }
-  node->next = pt;
-  prev_pt->next = node;
 }
 
 void skip_list::sl_promote(list_ele_t *node, list_ele_t **prev_pts, int list_num) {
@@ -179,11 +198,34 @@ void skip_list::sl_promote(list_ele_t *node, list_ele_t **prev_pts, int list_num
   }
   i = 1;
   while (sl_roll() && i < NUM_LISTS) {
-    memcpy(node + i, node, sizeof(list_ele_t));
+    memcpy(&node[i], node, sizeof(list_ele_t));
     (&node[i])->next = prev_pts[i]->next;
     prev_pts[i]->next = &node[i];
     i++;
   }
+}
+
+list_ele_t *skip_list::ll_insert(list_ele_t *node, list_ele_t *start) {
+  assert (0 <= sl_compare(node->hash, start->hash));
+  if (0 == sl_compare(node->hash, start->hash)) {
+    node->next = start->next;
+    start->next = node;
+    return start;
+  }
+  list_ele_t *pt = start;
+  list_ele_t *prev = pt;
+  while (prev->next != NULL) {
+    pt = pt->next;
+    if (0 < sl_compare(pt->hash, node->hash)) {
+      node->next = pt;
+      prev->next = node;
+      return prev;
+    }
+    prev = pt; 
+  } 
+  prev->next = node;
+  node->next = NULL;
+  return prev;
 }
 
 
@@ -194,14 +236,24 @@ void test_sl() {
   list_ele_t *node1 = pack(val, size, (void *) 1);
   list_ele_t *node2 = pack(val, size, (void *) 2);
   list_ele_t *node3 = pack(val, size, (void *) 3);
+  list_ele_t *node4 = pack(val, size, (void *) 10);
+  list_ele_t *node5 = pack(val, size, (void *) 15);
   skip_list sl;
   sl.sl_insert(node1);
   sl.sl_insert(node3);
   
+  sl.sl_insert(node5);
   sl.sl_insert(node2);
-  sl.sl_insert(node2);
+  sl.sl_delete(node3);
+  sl.sl_insert(node4);
   sl.sl_insert(node3);
-  sl.sl_print(NULL);
+  sl.sl_delete(node1); 
+  sl.sl_delete(node5);
+  sl.sl_insert(node1);
+  sl.sl_insert(node3);
+  sl.sl_print(sl.sl_search((void *) 10));
+  printf("\n");
+  sl.sl_print(sl.sl_search((void *) 15));
   return;
 }
 
